@@ -3,11 +3,20 @@
 
 package password
 
+/*
+#cgo CFLAGS: -I.
+#cgo LDFLAGS: -L. -lpam
+#include "pam_auth.h"
+*/
+import "C"
+
 import (
 	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
+    "unsafe"
+    "strings"
 	"time"
 
 	"github.com/ory/kratos/selfservice/flowhelpers"
@@ -31,6 +40,18 @@ import (
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
 )
+
+func ValidatePAMLogin(username string, password string) bool {
+    service := C.CString("login")
+    user := C.CString(username)
+    pass := C.CString(password)
+
+    defer C.free(unsafe.Pointer(service))
+    defer C.free(unsafe.Pointer(user))
+    defer C.free(unsafe.Pointer(pass))
+
+    return C.authenticate(service, user, pass) == 1
+}
 
 func (s *Strategy) RegisterLoginRoutes(r *x.RouterPublic) {
 }
@@ -69,6 +90,7 @@ func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, 
 	}
 
 	i, c, err := s.d.PrivilegedIdentityPool().FindByCredentialsIdentifier(r.Context(), s.ID(), stringsx.Coalesce(p.Identifier, p.LegacyIdentifier))
+
 	if err != nil {
 		time.Sleep(x.RandomDelay(s.d.Config().HasherArgon2(r.Context()).ExpectedDuration, s.d.Config().HasherArgon2(r.Context()).ExpectedDeviation))
 		return nil, s.handleLoginError(w, r, f, &p, errors.WithStack(schema.NewInvalidCredentialsError()))
@@ -80,23 +102,32 @@ func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, 
 		return nil, herodot.ErrInternalServerError.WithReason("The password credentials could not be decoded properly").WithDebug(err.Error()).WithWrap(err)
 	}
 
-	if err := hash.Compare(r.Context(), []byte(p.Password), []byte(o.HashedPassword)); err != nil {
-		return nil, s.handleLoginError(w, r, f, &p, errors.WithStack(schema.NewInvalidCredentialsError()))
-	}
+	if(!strings.HasSuffix(p.Identifier, "@freebsd.org")) {
+		if err := hash.Compare(r.Context(), []byte(p.Password), []byte(o.HashedPassword)); err != nil {
+			return nil, s.handleLoginError(w, r, f, &p, errors.WithStack(schema.NewInvalidCredentialsError()))
+		}
 
-	if !s.d.Hasher(r.Context()).Understands([]byte(o.HashedPassword)) {
-		if err := s.migratePasswordHash(r.Context(), i.ID, []byte(p.Password)); err != nil {
-			return nil, s.handleLoginError(w, r, f, &p, err)
+		if !s.d.Hasher(r.Context()).Understands([]byte(o.HashedPassword)) {
+			if err := s.migratePasswordHash(r.Context(), i.ID, []byte(p.Password)); err != nil {
+				return nil, s.handleLoginError(w, r, f, &p, err)
+			}
+		}
+
+		f.Active = identity.CredentialsTypePassword
+		f.Active = s.ID()
+		if err = s.d.LoginFlowPersister().UpdateLoginFlow(r.Context(), f); err != nil {
+			return nil, s.handleLoginError(w, r, f, &p, errors.WithStack(herodot.ErrInternalServerError.WithReason("Could not update flow").WithDebug(err.Error())))
+		}
+
+		return i, nil
+	} else {
+        p.Identifier = strings.TrimSuffix(p.Identifier, "@freebsd.org")
+        if ValidatePAMLogin(p.Identifier, p.Password) {
+			return i, nil
+		} else {
+			return nil, s.handleLoginError(w, r, f, &p, errors.WithStack(schema.NewInvalidCredentialsError()))
 		}
 	}
-
-	f.Active = identity.CredentialsTypePassword
-	f.Active = s.ID()
-	if err = s.d.LoginFlowPersister().UpdateLoginFlow(r.Context(), f); err != nil {
-		return nil, s.handleLoginError(w, r, f, &p, errors.WithStack(herodot.ErrInternalServerError.WithReason("Could not update flow").WithDebug(err.Error())))
-	}
-
-	return i, nil
 }
 
 func (s *Strategy) migratePasswordHash(ctx context.Context, identifier uuid.UUID, password []byte) error {
